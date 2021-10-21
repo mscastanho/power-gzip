@@ -3,7 +3,7 @@ include ../config.mk
 SRC =
 INC = ../inc_nx
 LDFLAGS = -L../lib
-LDLIB = ../lib/libnxz.a -lpthread
+LDLIB = -lz -lpthread
 TESTS = gunzip_nx_test gzip_nxfht_test gzip_nxdht_test compdecomp_th \
 	bad_irq_check rand_pfault_check
 NXFLAGS = #-DNXDBG  #-DNXDBG -DNX_MMAP
