@@ -1511,12 +1511,163 @@ static inline void nx_compress_update_checksum(nx_streamp s, int combine)
 	prt_info("nx_compress_update_checksum crc32 %08x adler32 %08x\n", s->crc32, s->adler32);
 }
 
+/* Simply copy input to output */
+static int nx_deflate_literal(nx_streamp s, int flush) {
+	uint32_t avail_out = s->avail_out;
+	uint32_t old_tebc = s->tebc;
+	int bfinal = 0;
+	int rc;
+
+	print_dbg_info(s, __LINE__);
+	prt_info("%s:%d need_stored_block %d, tebc %d\n", __FUNCTION__, __LINE__, s->need_stored_block, s->tebc);
+
+	while (s->avail_out > 0 && s->need_stored_block > 0) {
+		/* reminder of the output block start offset */
+		char *blk_head = (char*) s->next_out;
+
+		/* ensure that job size is nx_stored_block_len or less */
+		uint32_t nbytes_this_iteration = NX_MIN( s->need_stored_block, nx_stored_block_len );
+
+		/* write a stored block header, sync flush as
+		   a placeholder, zero length and not final;
+		   updates the update_stream_out pointers */
+		append_spanning_flush(s, Z_SYNC_FLUSH, s->tebc, 0);
+
+		s->spbc = 0;
+
+		if (s->avail_in > 0 || s->used_in > 0 ) {
+			/* copy input to output at most by nx_stored_block_len */
+			rc = nx_compress_block(s, GZIP_FC_WRAP, nbytes_this_iteration);
+			if (rc != LIBNX_OK)
+				return Z_STREAM_ERROR;
+			/* TODO: Check if this is needed*/
+			/* loop_cnt = 0; /\* update when making progress *\/ */
+			nx_compress_update_checksum(s, 1);
+		}
+
+		if (s->avail_in == 0 && s->used_in == 0 && flush == Z_FINISH ) {
+			s->status = NX_BFINAL_ST;
+			bfinal = 1;
+		}
+
+		/* rewrite header with the amount copied and final bit
+		   if needed.  spbc has the actual copied bytes
+		   amount */
+		rewrite_spanning_flush(s, blk_head, avail_out, old_tebc, bfinal, s->spbc);
+
+		/* subtract the amount processed so far */
+		s->need_stored_block -= s->spbc;
+
+	} /* while (s->avail_out > 0 && s->need_stored_block > 0)  */
+
+	s->need_stored_block = 0;
+
+	return Z_OK;
+}
+
+static int nx_deflate_fixed(nx_streamp s, int flush) {
+	int rc;
+	print_dbg_info(s, __LINE__);
+
+	rc = nx_compress_block(s, GZIP_FC_COMPRESS_RESUME_FHT, nx_config.per_job_len);
+
+	if (unlikely(rc == LIBNX_OK_BIG_TARGET)) {
+		/* compressed data has expanded; write a type0
+		 * block instead; we're going to repeat with
+		 * last source */
+		s->need_stored_block = s->spbc; /* amount to repeat */
+		s->tebc = 0; /* override it since we cancelled
+			      * last job; and prev block would
+			      * have sync flushed */
+		prt_info("%s:%d need_stored_block, spbc %d\n", __FUNCTION__, __LINE__, s->spbc);
+		return Z_ERRNO;
+	}
+
+	if (rc != LIBNX_OK) {
+		prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
+		return Z_STREAM_ERROR;
+	}
+
+	/* TODO: Check if this is needed*/
+	/* loop_cnt = 0; /\* update when making progress *\/ */
+
+	nx_compress_update_checksum(s, 0);
+
+	return Z_OK;
+}
+
+static int nx_deflate_default (nx_streamp s, int flush) {
+	int rc;
+
+	print_dbg_info(s, __LINE__);
+
+	if (s->invoke_cnt == 0)
+		dht_lookup(s->nxcmdp, dht_default_req, s->dhthandle);
+	else
+		dht_lookup(s->nxcmdp, dht_search_req, s->dhthandle);
+
+	rc = nx_compress_block(s, GZIP_FC_COMPRESS_RESUME_DHT_COUNT, nx_config.per_job_len);
+
+	if (unlikely(rc == LIBNX_OK_BIG_TARGET)) {
+		/* compressed data has expanded; we're
+		 * going to repeat with last source using
+		 * fixed Huffman block */
+		/* TODO: Is there a better error value here? */
+		return Z_ERRNO;
+	}
+
+	if (rc != LIBNX_OK) {
+		prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
+		return Z_STREAM_ERROR;
+	}
+
+	/* loop_cnt = 0; /\* update when making progress *\/ */
+
+	nx_compress_update_checksum(s, 0);
+
+	return Z_OK;
+}
+
+static int nx_deflate_(nx_streamp s, int flush) {
+	int rc = Z_OK;
+
+	/* level=0 is when zlib copies input to output uncompressed */
+	if ((s->level == 0 && s->avail_out > 0) || (s->need_stored_block > 0)) {
+		return nx_deflate_literal(s, flush);
+	}
+	else if (s->strategy == Z_FIXED ||
+		   ((s->strategy == Z_DEFAULT_STRATEGY) &&
+		    (s->dict_len > 0) && (s->avail_in < DEF_DICT_THRESHOLD))) {
+		/* for small input data and with a dictionary Z_FIXED
+		 * should yield smaller output */
+		return nx_deflate_fixed(s, flush);
+
+	}
+	else if (s->strategy == Z_DEFAULT_STRATEGY) { /* dynamic huffman */
+		rc = nx_deflate_default(s, flush);
+		if (unlikely(rc == Z_ERRNO)) {
+			/* compressed data has expanded; we're
+			 * going to repeat with last source using
+			 * fixed Huffman block */
+			s->strategy = Z_FIXED;
+			s->tebc = 0; /* not valid since we're
+				      * repeating; last block would
+				      * have sync flushed */
+			prt_info("%s:%d Expanded, trying fixed Huffman, spbc %d, tebc %d\n", __FUNCTION__, __LINE__, s->spbc, s->tebc);
+			rc = nx_deflate_fixed(s, flush);
+		}
+	}
+
+	return rc;
+}
+
 /* deflate interface */
 int nx_deflate(z_streamp strm, int flush)
 {
 	retlibnx_t rc;
 	nx_streamp s;
-	const int combine_cksum = 1;
+	/* TODO: Remove this */
+	/* const int combine_cksum = 1; */
 	long loop_cnt = 0, loop_max = 0xffff;
 	void *temp = NULL;
 
@@ -1559,8 +1710,6 @@ int nx_deflate(z_streamp strm, int flush)
 
 	s->switchable = 0;
 
-
-	nx_gzip_crb_cpb_t *cmdp = s->nxcmdp;
 
 	/* sync nx_stream with z_stream */
 	s->next_in = s->zstrm->next_in;
@@ -1695,118 +1844,18 @@ s3:
 		return TRACERET(Z_STREAM_ERROR);
 	}
 
-	/* level=0 is when zlib copies input to output uncompressed */
-	if ((s->level == 0 && s->avail_out > 0) || (s->need_stored_block > 0)) {
-		uint32_t avail_out = s->avail_out;
-		uint32_t old_tebc = s->tebc;
-		int bfinal = 0;
 
-		print_dbg_info(s, __LINE__);
-		prt_info("%s:%d need_stored_block %d, tebc %d\n", __FUNCTION__, __LINE__, s->need_stored_block, s->tebc);
-
-		while (s->avail_out > 0 && s->need_stored_block > 0) {
-			/* reminder of the output block start offset */
-			char *blk_head = (char*) s->next_out;
-
-			/* ensure that job size is nx_stored_block_len or less */
-			uint32_t nbytes_this_iteration = NX_MIN( s->need_stored_block, nx_stored_block_len );
-
-			/* write a stored block header, sync flush as
-			   a placeholder, zero length and not final;
-			   updates the update_stream_out pointers */
-			append_spanning_flush(s, Z_SYNC_FLUSH, s->tebc, 0);
-
-			s->spbc = 0;
-
-			if (s->avail_in > 0 || s->used_in > 0 ) {
-				/* copy input to output at most by nx_stored_block_len */
-				rc = nx_compress_block(s, GZIP_FC_WRAP, nbytes_this_iteration);
-				if (rc != LIBNX_OK)
-					return TRACERET(Z_STREAM_ERROR);
-				loop_cnt = 0; /* update when making progress */
-				nx_compress_update_checksum(s, combine_cksum);
-			}
-
-			if (s->avail_in == 0 && s->used_in == 0 && flush == Z_FINISH ) {
-				s->status = NX_BFINAL_ST;
-				bfinal = 1;
-			}
-
-			/* rewrite header with the amount copied and final bit
-			   if needed.  spbc has the actual copied bytes
-			   amount */
-			rewrite_spanning_flush(s, blk_head, avail_out, old_tebc, bfinal, s->spbc);
-
-			/* subtract the amount processed so far */
-			s->need_stored_block -= s->spbc;
-
-		} /* while (s->avail_out > 0 && s->need_stored_block > 0)  */
-
-		s->need_stored_block = 0;
-	}
-	else if (s->strategy == Z_FIXED ||
-		   ((s->strategy == Z_DEFAULT_STRATEGY) &&
-		    (s->dict_len > 0) && (s->avail_in < DEF_DICT_THRESHOLD))) {
-		/* for small input data and with a dictionary Z_FIXED
-		 * should yield smaller output */
-		print_dbg_info(s, __LINE__);
-
-		rc = nx_compress_block(s, GZIP_FC_COMPRESS_RESUME_FHT, nx_config.per_job_len);
-
-		if (unlikely(rc == LIBNX_OK_BIG_TARGET)) {
-			/* compressed data has expanded; write a type0
-			 * block instead; we're going to repeat with
-			 * last source */
-			s->need_stored_block = s->spbc; /* amount to repeat */
-			s->tebc = 0; /* override it since we cancelled
-				      * last job; and prev block would
-				      * have sync flushed */
-			prt_info("%s:%d need_stored_block, spbc %d\n", __FUNCTION__, __LINE__, s->spbc);
-			goto s1;
-		}
-
-		if (rc != LIBNX_OK) {
-			prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
-			return TRACERET(Z_STREAM_ERROR);
-		}
-
-		loop_cnt = 0; /* update when making progress */
-
-		nx_compress_update_checksum(s, !combine_cksum);
-	}
-	else if (s->strategy == Z_DEFAULT_STRATEGY) { /* dynamic huffman */
-
-		print_dbg_info(s, __LINE__);
-
-		if (s->invoke_cnt == 0)
-			dht_lookup(cmdp, dht_default_req, s->dhthandle);
-		else
-			dht_lookup(cmdp, dht_search_req, s->dhthandle);
-
-		rc = nx_compress_block(s, GZIP_FC_COMPRESS_RESUME_DHT_COUNT, nx_config.per_job_len);
-
-		if (unlikely(rc == LIBNX_OK_BIG_TARGET)) {
-			/* compressed data has expanded; we're
-			 * going to repeat with last source using
-			 * fixed Huffman block */
-			s->strategy = Z_FIXED;
-			s->tebc = 0; /* not valid since we're
-				      * repeating; last block would
-				      * have sync flushed */
-			prt_info("%s:%d Expanded, trying fixed Huffman, spbc %d, tebc %d\n", __FUNCTION__, __LINE__, s->spbc, s->tebc);
-			goto s1;
-		}
-		if (rc != LIBNX_OK) {
-			prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
-			return TRACERET(Z_STREAM_ERROR);
-		}
-
-		loop_cnt = 0; /* update when making progress */
-
-		nx_compress_update_checksum(s, !combine_cksum);
-	}
-
+	rc = nx_deflate_(s, flush);
 	print_dbg_info(s, __LINE__);
+
+	/* Need to repeat */
+	if (rc == Z_ERRNO)
+		goto s1;
+
+	if (rc != Z_OK) {
+		prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
+		return TRACERET(Z_STREAM_ERROR);
+	}
 
 	int buffer_state = (s->avail_out > 0)<<3 | (s->used_out > 0)<<2 | (s->avail_in > 0)<<1 | (s->used_in > 0);
 
