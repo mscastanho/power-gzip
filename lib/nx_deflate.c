@@ -1733,155 +1733,166 @@ int nx_deflate(z_streamp strm, int flush)
 
 	/* issue 99 */
 	if (s->avail_out > 0 && s->used_out == 0 && s->avail_in == 0 && s->used_in == 0) {
-		if (s->flush == Z_FINISH) {
-			goto s1;
-		}
-		else if (s->flush == Z_NO_FLUSH) {
+		/* if (s->flush == Z_FINISH) { */
+		/* 	goto s1; */
+		/* } */
+		if (s->flush == Z_NO_FLUSH) {
 			return TRACERET(Z_BUF_ERROR);
 		}
 		else if (s->flush == Z_PARTIAL_FLUSH || s->flush == Z_SYNC_FLUSH || s->flush == Z_FULL_FLUSH)
 			return TRACERET(Z_OK);
 	}
 
-	/* Generate a header */
-	if ((s->status & (NX_ZLIB_INIT_ST | NX_GZIP_INIT_ST | NX_RAW_INIT_ST)) != 0) {
-		prt_info("nx_deflate_add_header s->flush %d s->status %d \n", s->flush, s->status);
-		nx_deflate_add_header(s); /* status becomes NX_DEFLATE_ST here */
-	}
+	for(;;){
+		/* when fifo_out has data copy it to output stream first */
+		if (s->used_out > 0) {
+			(void) nx_copy_fifo_out_to_nxstrm_out(s);
+			print_dbg_info(s, __LINE__);
 
-	/* if status is NX_BFINAL_ST, flush should be Z_FINISH */
-	if (s->status == NX_BFINAL_ST && flush != Z_FINISH)
-		return TRACERET(Z_STREAM_ERROR);
-
-	/* User must not provide more input after the first FINISH: */
-	if (s->status == NX_BFINAL_ST && s->avail_in != 0) {
-		prt_info("s->status is NX_BFINAL_ST but s->avail_out is not 0\n");
-		return TRACERET(Z_BUF_ERROR);
-	}
-
-s1:
-	if (++loop_cnt == loop_max) {
-		prt_err("can not make progress, loop_cnt = %ld\n", loop_cnt);
-		return TRACERET(Z_STREAM_ERROR);
-	}
-
-	/* when fifo_out has data copy it to output stream first */
-	if (s->used_out > 0) {
-		if (LIBNX_OK == nx_copy_fifo_out_to_nxstrm_out(s))
-			loop_cnt = 0;
-		print_dbg_info(s, __LINE__);
-
-		/* TODO:
-		 * The logic is a little confused here. Like some patches to pass the test.
-		 * Maybe need a new design and recombination.
-		 * */
-		if (!(s->status & (NX_BFINAL_ST | NX_TRAILER_ST))) {
-			if (s->avail_out == 0)
-				return TRACERET(Z_OK); /* need more output space */
-			if ((s->used_out == 0) && (s->avail_in == 0))
-				return TRACERET(Z_OK); /* no input here */
+			/* TODO: The logic is a little confused here. Like some
+			 * patches to pass the test.  Maybe need a new design
+			 * and recombination. */
+			if (!(s->status & (NX_BFINAL_ST | NX_TRAILER_ST))) {
+				if (s->avail_out == 0)
+					return TRACERET(Z_OK); /* need more output space */
+				if ((s->used_out == 0) && (s->avail_in == 0))
+					return TRACERET(Z_OK); /* no input here */
+			}
 		}
-	}
 
-	/* check if stream end has been reached */
-	if (s->avail_in == 0 && s->used_in == 0 && s->used_out == 0) {
-		if (s->status == NX_DEFLATE_ST) {
-			prt_info("     change status NX_DEFLATE_ST to NX_BFINAL_ST\n");
-			append_spanning_flush(s, Z_SYNC_FLUSH, 0, 1);
-			s->status = NX_BFINAL_ST;
-		}
-		if (s->status == NX_BFINAL_ST) {
+		switch (s->status){
+		case NX_GZIP_INIT_ST:
+		case NX_RAW_INIT_ST:
+		case NX_ZLIB_INIT_ST:
+			/* Generate a header */
+			prt_info("nx_deflate_add_header s->flush %d s->status %d \n", s->flush, s->status);
+			nx_deflate_add_header(s); /* status becomes NX_DEFLATE_ST here */
+			break;
+		case NX_DEFLATE_ST:
+			if (s->avail_in == 0 && s->used_in == 0 && s->used_out == 0) {
+				prt_info("     change status NX_DEFLATE_ST to NX_BFINAL_ST\n");
+				append_spanning_flush(s, flush, 0, 1);
+				s->status = NX_BFINAL_ST;
+			}
+
+			if ( ((s->used_in + s->avail_in) <= nx_config.compress_threshold) && /* large input */
+				(flush != Z_SYNC_FLUSH)    &&      /* or requesting flush */
+				(flush != Z_PARTIAL_FLUSH) &&
+				(flush != Z_FULL_FLUSH)    &&
+				(flush != Z_FINISH)        &&	/* or requesting finish */
+				(s->level != 0)) {                  /* or raw copy */
+			}
+			else if (s->dict_len == 0) {
+				/* if dictionary present do not buffer small input */
+				if (s->fifo_in == NULL) {
+					s->len_in = nx_config.deflate_fifo_in_len;
+					if (NULL == (s->fifo_in = nx_alloc_buffer(s->len_in, s->page_sz, 0)))
+						return TRACERET(Z_MEM_ERROR);
+				}
+				/* small input and no request made for flush or finish */
+				small_copy_nxstrm_in_to_fifo_in(s);
+				return TRACERET(Z_OK);
+			}
+
+			if (++loop_cnt == loop_max) {
+				prt_err("can not make progress on s3, loop_cnt = %ld\n", loop_cnt);
+				return TRACERET(Z_STREAM_ERROR);
+			}
+
+			rc = nx_deflate_(s, flush);
+			print_dbg_info(s, __LINE__);
+
+			/* Need to repeat */
+			if (rc == Z_ERRNO)
+				break;
+
+			if (rc != Z_OK) {
+				prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
+				return TRACERET(Z_STREAM_ERROR);
+			}
+
+			int buffer_state = (s->avail_out > 0)<<3 | (s->used_out > 0)<<2 | (s->avail_in > 0)<<1 | (s->used_in > 0);
+
+			prt_info("buffer state %d flush %d\n", buffer_state, s->flush);
+
+			switch (buffer_state) {
+			case 0b0000: /* no output space and no input data */
+			case 0b1000: /* have output space, no inputs */
+				if (s->flush == Z_FINISH)
+					break; /* we need to append the trailer then return Z_STREAM_END */
+				else
+					return TRACERET(Z_OK); /* more data may come */
+				break;
+			case 0b0001: /* no output space and various input combinations */
+			case 0b0010:
+			case 0b0011:
+			case 0b0100:
+			case 0b0101:
+			case 0b0110:
+			case 0b0111: /* no output space, have fifo_out data */
+				return TRACERET(Z_OK); break;
+			case 0b1001: /* have output space; have fifo_in data */
+			case 0b1010: /* have output space; have input data */
+			case 0b1011: /* have output space; have input data; have fifo_in data */
+				continue;
+			case 0b1100: /* have output space, have fifo_out data */
+			case 0b1101: /* have output space, have fifo_out data, have fifo_in data */
+			case 0b1110: /* have output space, have fifo_out data, have input data */
+			case 0b1111: /* have output space, have fifo_out data, have input data, have fifo_in data */
+				/* since we have fifo_out data, go to s1 which will move it to user stream buffer */
+				continue;
+			}
+			break;
+		case NX_BFINAL_ST:
+			/* if status is NX_BFINAL_ST, flush should be Z_FINISH */
+			if (flush != Z_FINISH)
+				return TRACERET(Z_STREAM_ERROR);
+
+			/* User must not provide more input after the first FINISH */
+			if (s->avail_in != 0) {
+				prt_info("s->status is NX_BFINAL_ST but s->avail_out is not 0\n");
+				return TRACERET(Z_BUF_ERROR);
+			}
+
+			if (!(s->avail_in == 0 && s->used_in == 0 && s->used_out == 0))
+				break;
+
 			prt_info("     change status NX_BFINAL_ST to NX_TRAILER_ST\n");
 			nx_compress_append_trailer(s);
 			s->status = NX_TRAILER_ST;
+			/* fallthrough*/
+		case NX_TRAILER_ST:
+			if (s->avail_in == 0 && s->used_in == 0 && s->used_out == 0)
+				return TRACERET(Z_STREAM_END);
+
 		}
 
-		print_dbg_info(s, __LINE__);
-		prt_info("s->zstrm->total_out %ld s->status %ld\n", (long)s->zstrm->total_out, (long)s->status);
-		if (s->used_out == 0 && s->status == NX_TRAILER_ST)
-			return TRACERET(Z_STREAM_END);
+		/* check if stream end has been reached */
+		if (s->avail_in == 0 && s->used_in == 0 && s->used_out == 0) {
+			if (s->flush == Z_FINISH)
+				return TRACERET(Z_STREAM_END);
 
-		if (s->used_out == 0 && s->flush == Z_FINISH)
-			return TRACERET(Z_STREAM_END);
+			if (s->status == NX_DEFLATE_ST) {
+				prt_info("     change status NX_DEFLATE_ST to NX_BFINAL_ST\n");
+				append_spanning_flush(s, Z_SYNC_FLUSH, 0, 1);
+				s->status = NX_BFINAL_ST;
+			}
+			if (s->status == NX_BFINAL_ST) {
+				prt_info("     change status NX_BFINAL_ST to NX_TRAILER_ST\n");
+				nx_compress_append_trailer(s);
+				s->status = NX_TRAILER_ST;
+			}
 
-		return TRACERET(Z_OK);
-	}
+			print_dbg_info(s, __LINE__);
+			prt_info("s->zstrm->total_out %ld s->status %ld\n", (long)s->zstrm->total_out, (long)s->status);
+			if (s->used_out == 0 && s->status == NX_TRAILER_ST)
+				return TRACERET(Z_STREAM_END);
 
-s2:
-	/* fifo_out can be copied out */
-	if (s->avail_out > 0 && s->used_out > 0)
-		goto s1;
+			if (s->used_out == 0 && s->flush == Z_FINISH)
+				return TRACERET(Z_STREAM_END);
 
-	/*  avail_out > 0 and used_out == 0 */
-	// assert(s->avail_out > 0 && s->used_out == 0);
-
-	if ( ((s->used_in + s->avail_in) <= nx_config.compress_threshold) && /* large input */
-	     (flush != Z_SYNC_FLUSH)    &&      /* or requesting flush */
-	     (flush != Z_PARTIAL_FLUSH) &&
-	     (flush != Z_FULL_FLUSH)    &&
-	     (flush != Z_FINISH)        &&	/* or requesting finish */
-	     (s->level != 0)) {                  /* or raw copy */
-	}
-	else if (s->dict_len == 0) {
-		/* if dictionary present do not buffer small input */
-		if (s->fifo_in == NULL) {
-			s->len_in = nx_config.deflate_fifo_in_len;
-			if (NULL == (s->fifo_in = nx_alloc_buffer(s->len_in, s->page_sz, 0)))
-				return TRACERET(Z_MEM_ERROR);
+			return TRACERET(Z_OK);
 		}
-		/* small input and no request made for flush or finish */
-		small_copy_nxstrm_in_to_fifo_in(s);
-		return TRACERET(Z_OK);
-	}
-
-	if (++loop_cnt == loop_max) {
-		prt_err("can not make progress on s3, loop_cnt = %ld\n", loop_cnt);
-		return TRACERET(Z_STREAM_ERROR);
-	}
-
-
-	rc = nx_deflate_(s, flush);
-	print_dbg_info(s, __LINE__);
-
-	/* Need to repeat */
-	if (rc == Z_ERRNO)
-		goto s1;
-
-	if (rc != Z_OK) {
-		prt_warn("%s:%d nx_compress_block returned %d\n", __FUNCTION__, __LINE__, rc);
-		return TRACERET(Z_STREAM_ERROR);
-	}
-
-	int buffer_state = (s->avail_out > 0)<<3 | (s->used_out > 0)<<2 | (s->avail_in > 0)<<1 | (s->used_in > 0);
-
-	prt_info("buffer state %d flush %d\n", buffer_state, s->flush);
-
-	switch (buffer_state) {
-	case 0b0000: /* no output space and no input data */
-	case 0b1000: /* have output space, no inputs */
-		if (s->flush == Z_FINISH)
-			goto s1; /* we need to append the trailer then return Z_STREAM_END */
-		else
-			return TRACERET(Z_OK); /* more data may come */
-		break;
-	case 0b0001: /* no output space and various input combinations */
-	case 0b0010:
-	case 0b0011:
-	case 0b0100:
-	case 0b0101:
-	case 0b0110:
-	case 0b0111: /* no output space, have fifo_out data */
-		return TRACERET(Z_OK); break;
-	case 0b1001: /* have output space; have fifo_in data */
-	case 0b1010: /* have output space; have input data */
-	case 0b1011: /* have output space; have input data; have fifo_in data */
-		goto s2; break;
-	case 0b1100: /* have output space, have fifo_out data */
-	case 0b1101: /* have output space, have fifo_out data, have fifo_in data */
-	case 0b1110: /* have output space, have fifo_out data, have input data */
-	case 0b1111: /* have output space, have fifo_out data, have input data, have fifo_in data */
-		/* since we have fifo_out data, go to s1 which will move it to user stream buffer */
-		goto s1; break;
 	}
 
 	ASSERT(!"nx_deflate should not get here");
